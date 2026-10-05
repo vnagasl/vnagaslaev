@@ -1,0 +1,981 @@
+#!/usr/bin/python
+# analyse_tbt_mframe.py
+
+import sys
+import math
+from scipy.optimize import curve_fit,minimize
+import os
+import tkinter as tk
+from tkinter import filedialog
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import numpy as np
+import subprocess
+import traceback
+from paths import INPUT_DIR, OUTPUT_DIR
+            
+class analyseData:
+    static_instance=None
+    def __init__(self,name):
+        self.name=name
+        self.DEBUG=0.15
+        self.tbtMode=1
+        self.fname=str(INPUT_DIR / "tbt_pos_06-03-2026_10-03.csv")
+        self.Nturns=2000
+        self.NT_tbt=100
+        self.tune=0.65
+        self.PI=3.1415926
+        self.ampin=0.5
+        self.phsin=0.05   # in radians
+        self.ampaux=0.5
+        self.phsaux=0.05   # in radians
+#        self.TwissFileName="FunctionsAtBPMs_newOptics_ESS1.dat"
+        self.TwissFileName=str(INPUT_DIR / "FunctionsAtBPMs_newOptics_BPH301.dat")
+        self.twiss={}; self.bpmNames=[]; self.avray={}; self.avray0={};
+        self.data={}; self.intn={}; self.fitDict={}; self.bpmSign={};
+        self.data2={}; self.turnData={};
+        self.badList=[]; self.skipList=[]; self.signArr=[[],[],[],[]];
+        print("analyseData \"",self.name,"\" initialized with data ",self.fname)
+        
+# bpmList has to be specified!
+        self.bpmList=["HP203", "HP205", "HP207", "HP209", "HP211", "HP213", 
+"HP215", "HP217", "HP219", "HP119", "HP117", "HP115", "HP113", 
+"HP111", "HP109", "HP107", "HP105", "HP103", "HP101", "HP601"]
+
+    @staticmethod
+    def get_instance():
+        if analyseData.static_instance is None:
+            analyseData.static_instance=analyseData("Static instance")
+        return analyseData.static_instance
+
+    def get_name(self):
+        return self.name
+            
+    def set_data_name(self,fname):
+        self.fname=fname
+            
+    def get_data_name(self):
+        return self.fname
+            
+    def readTwissFunctions(self,tname):
+        ilineT=0; bdict={};
+        for line in open(tname):
+            if line[0]=="#": continue
+            words=line.split()
+            index=int(words[0])
+            elName=words[1]
+            if(elName.find("iBPH")>-1): elName="HP"+elName[4:]
+            Spos=float(words[2])*0.01
+            betaX=float(words[3])*0.01
+            alpX=float(words[4])
+            muX=float(words[12])
+#            if(elName in self.bpmNames):
+            print("read TwissFunctions", elName)
+            if(elName.find("HP")>=0):
+                print(ilineT, " bpm Name ",elName," betaX=",betaX," muX=",muX)
+                buffer=[Spos,betaX,alpX,muX]
+                bdict[elName]=buffer
+                ilineT +=1
+        return bdict;
+
+    def readData(self,nt,fname, firstFile=True):
+        jbpm=0; buffer={}; jturn=-1; bpmNmsLoc=[];
+        for strn in open(fname):   
+            if(self.DEBUG > 0.9 and jturn < 10): print("String ", strn[:50])
+            line=""; n=0
+            for c in strn:
+                code=ord(c)
+                if(code==9): code=32; c=" ";
+                if(code >31 and code < 128):
+                    line +=c
+                    n +=1
+            words=line.split(",")
+            if(self.DEBUG > 0.9):print("Mark 1:", len(words), words[0], words[1])
+            if(jturn==-1):
+                for word in words:      # first line - BPM names
+                    word=word.replace('"','')
+                    if (word.find("HF") >=0): word="HP"+word[3:6]
+                    elif(word.find("HI") >=0):word="HP"+word[2:5]
+###                    word="HP"+word[2:5]   # only for George data
+                    if (word.find("HP") >=0):
+                        BPMname=word
+# store all BPMs in locl bpmNmsLoc, not self.bpmNames!
+                        bpmNmsLoc.append(BPMname)
+                        if(self.DEBUG > 0.4):print("Check 2:", jturn, word, BPMname)
+                        if(not (BPMname in self.skipList)):
+                            buffer[BPMname]=[]
+                            jbpm +=1
+                jturn +=1
+            else:     # all other lines:  itrn, coordinates
+                jwords=-1
+                for word in words:
+                    word=word.replace('"','')
+                    jwords +=1
+                    if(jwords==0): continue
+                    if(jwords>=0):
+                        BPMname=bpmNmsLoc[jwords-1]
+                        try:
+                            Z=float(word)
+                        except ValueError:
+                            print("ValueError:  BPM ", BPMname," data, bad word ",word)
+                            Z=0.0
+                        if(jturn<10 and self.DEBUG >0.9): print("Mark 2: ", jturn, jwords, word, BPMname,Z)
+                        if(not (BPMname in self.skipList)):
+                            buffer[BPMname].append(Z)
+                jturn +=1
+                if(jturn == nt): break
+        if (firstFile): self.bpmNames=bpmNmsLoc
+        return buffer
+
+    def calcRawOffsets(self):
+        jbpm=0; buffer={};
+        for BPMname in self.data.keys():
+            coor=self.data[BPMname]
+            AVR=sum(coor)/len(coor)
+            buffer[BPMname]=AVR
+#            print("Offset in BPM ",BPMname," =",AVR)
+            for i in range(len(coor)):
+                coor[i] -= AVR
+            self.data[BPMname]=coor
+        return buffer
+
+    def calcRawOffsets2(self):
+        jbpm=0; buffer={};
+        for BPMname in self.data2.keys():
+            coor=self.data2[BPMname]
+            AVR=sum(coor)/len(coor)
+            buffer[BPMname]=AVR
+#            print("Offset in BPM ",BPMname," =",AVR)
+            for i in range(len(coor)):
+                coor[i] -= AVR
+            self.data2[BPMname]=coor
+        return buffer
+
+    def refOrbits(self):
+#        def func(x,a,b,c,d):
+#            return a*np.sin(x*c+b)+d
+        muDict={}
+        for bname in self.data2.keys():
+            muX=self.twiss[bname][3]
+            muDict[muX]=bname
+        muArr=list(muDict.keys())
+        muArr.sort()
+        f2name=OUTPUT_DIR / "refOrbit.dat"
+        fOut=open(f2name,"w")
+        Nturns=10   # fix for now to debug
+        for turn in range(Nturns):
+            for mux in muArr:
+                xname=muDict[mux]
+                beta=self.twiss[xname][1]
+                muc=mux+(9.0+self.tune)*turn
+                X=self.data2[xname][turn]
+                Xn=X/math.sqrt(beta)
+                strOut=str(muc)+" "+str(turn)+" "+str(X)+" "+str(Xn)+" "+xname+"\n"
+                print(strOut)
+                fOut.write(strOut)
+        fOut.close()
+        return
+#        muArrRot=np.roll(muArr,-inStart)
+#        buf={}; 
+#        xarr=[]; yarr=[];
+#        for jturn in range(3):
+#            for mux in muArrRot:
+#                muc=mux+(9+self.tune)*jturn
+#                xname=muDict[mux]
+#                jdata=jturn
+#                if(mux < muStart):
+#                    if(jturn==2): break
+#                    muc +=(9+self.tune)
+#                    jdata =jturn+1
+#                X=self.data[xname][jdata]
+#                S=self.twiss[xname][0]
+#                beta=self.twiss[xname][1]
+#                alpha=self.twiss[xname][2]
+#                mu=self.twiss[xname][3]
+#                Xn=X/math.sqrt(beta)
+#                buf[muc]=[X,Xn,S,beta,alpha,mu]
+#                if(jturn==0):
+#                    xarr.append(muc*2*math.pi);
+#                    yarr.append(Xn);
+#        in_guess=[5.0,0.0,1.0,0.0]
+#        bounds=([0.0,-math.pi,0.8,-1.0],[20.0,math.pi,1.2,1.0])
+#        popt,pcov = curve_fit(func, xarr, yarr,p0=in_guess, bounds=bounds,maxfev=5000)
+#        Amp,Phi,CR,DR=popt
+#        fname="tbt_short_orb.dat"
+#        fOut=open(fname,"w")
+#        for mux in buf.keys():
+#            strOut=str(mux)+" "+str(buf[mux][0])+" "+str(buf[mux][1])+" "+str(buf[mux][2])+" "+str(buf[mux][3])+" "+str(buf[mux][4])+" "+str(buf[mux][5])+"\n"
+#            fOut.write(strOut)
+#        fOut.close()
+#        return
+
+    def tbtFit(self,nt1,nt2):
+        fitbuff={}; avTunCor=0.0; avX=0.0; avY=0.0; MODE=1;
+        MODE=self.tbtMode
+        def func(x,a,b,c,d):
+            return a*np.sin(x*c+b)+d
+        for name in self.data.keys():
+            fitray={}; sqray={}; phiray={}; ampray={}; erray={}; baseray={};
+            buf=[];
+            SSX=0.0; SCX=0.0; SX=0.0; SCC=0.0; SSC=0.0; SSS=0.0; SX2=0.0;
+            corfit=[]
+            mu_bpm=self.twiss[name][3]     #the mu at BPM location
+#            phi_bpm=2*self.PI*mu_bpm          # phase at BPM location
+            if (MODE==1):
+                #    using scipy fit
+                xarr=[]; yarr=[];
+                for i in range(nt1,nt2):
+                    X=self.data[name][i]
+                    phi=2.0*self.PI*self.tune*i
+                    xarr.append(phi)
+                    yarr.append(X)
+# tbt fit for selected BPM in the range [nt1,nt2] turns
+# fit for the curve x=A*sin(2*pi*Q*turn+Phi)
+                in_guess=[5.0,0.0,1.0,0.0]
+                bounds=([0.0,-math.pi,0.8,-10.0],[20.0,math.pi,1.2,10.0])
+                popt,pcov = curve_fit(func, xarr, yarr,p0=in_guess, bounds=bounds,maxfev=20000)
+                Amp,Phi,CR,DR=popt
+#                print("Mode 1, ",name," A,Phi,CR,D=",Amp,Phi,CR,DR)
+            else:
+                # using custom MSQ fit Xfit=AR*sin(f_i)+BR*cos(f_i)
+                for i in range(nt1,nt2):
+                    X=self.data[name][i]
+                    SX +=X
+                DR=SX/(nt2-nt1);
+                SX=0.0
+                for i in range(nt1,nt2):
+                    X=self.data[name][i]-DR
+                    phi=2.0*self.PI*self.tune*i
+                    CC=np.cos(phi)
+                    SS=np.sin(phi)
+                    SSX += X*SS
+                    SCX += X*CC
+                    SCC += CC*CC
+                    SSS += SS*SS
+                    SSC += SS*CC
+                    SX += X
+                    SX2 += X*X
+                Den=(SSS*SCC-SSC*SSC)
+                BR=(SSX*SCC-SCX*SSC)/Den
+                AR=(SCX-BR*SSC)/SCC
+                CR=1.0;    # no tune fitting in MODE 1
+                Amp=math.sqrt(AR*AR+BR*BR)
+                Phi=math.atan2(BR,AR)
+            DDsv=0.0;
+            for i in range(nt1,nt2):
+                phi=2.0*self.PI*self.tune*i*CR
+                CC=np.cos(phi)
+                SS=np.sin(phi)
+                Xsv=Amp*math.sin(phi+Phi)+DR
+                Xme=self.data[name][i]
+                DDsv +=(Xsv-Xme)**2
+                corfit.append(Xsv)
+            fitray["Fit"]=corfit
+            avTunCor += CR
+            Phi0 = Phi-(mu_bpm%1)*2.0*self.PI
+            if(Phi0 < -self.PI): Phi0 +=2*self.PI
+            Xinj = Amp*np.sin(Phi0)
+            Yinj = Amp*np.cos(Phi0)
+#            avTunCor += 1    # custom fit - no tune correction
+            fitray["Err"]=math.sqrt(DDsv/float(nt2-nt1))                   # rms
+            fitray["Amp"]=Amp                                     # amplitude
+            fitray["Phi"]=Phi
+            fitray["Phi0"]=Phi0
+            fitray["Avr"]=DR
+            fitbuff[name]=fitray
+            avX +=Xinj
+            avY +=Yinj
+        avTunCor=avTunCor/len(self.data.keys())
+        tune_new=avTunCor*self.tune
+        avX = avX/len(self.data.keys())
+        avY = avY/len(self.data.keys())
+        avAmp = math.sqrt(avX*avX+avY*avY)
+        avPhi = math.atan2(avX,avY)
+        self.ampin=avAmp
+        self.phsin=avPhi
+        print("Tune tbtFit: seed tune=",self.tune," update =",tune_new," avPhi=",avPhi)
+        self.tune=tune_new
+        return fitbuff;      # tbtFit function 
+
+    def calcOffsets(self):
+        jbpm=0; buffer={};
+        for BPMname in self.data.keys():
+            AVR=self.fitDict[BPMname]["Avr"]
+            buffer[BPMname]=AVR
+            jbpm +=1
+        return buffer
+
+    def filterBPMs(self):
+        for name in self.data.keys():
+            if(abs(self.avray[name]) >= 20.0):   # checked only here
+                self.badList.append(name)             # badList is not skipList
+                if(self.DEBUG > 0.2):print("To BAD list: ",name," AVR=", self.avray[name])
+        for i in range(self.Nturns):
+            self.data[name][i] -= self.avray[name]
+
+    def signCheck(self):
+        for name in self.bpmNames:
+            if (name not in self.data.keys()):
+                print("not in signCheck list:", name)
+                continue
+            if (name in self.badList): continue
+            muX=self.twiss[name][3]
+#            muF1=3.141593*(1-2.0*(muX%1))
+            muF1=3.141593*(1-2.0*(muX))
+            muF2=3.141593*(1-2.0*(0.5+muX-math.floor(muX+0.5)))
+            phi=self.fitDict[name]["Phi"]
+#            sign=-1.0
+            sign=1.0
+#            if(abs(phi-muF1)>abs(phi-muF2)): sign=1.0
+            self.bpmSign[name]=sign
+            self.signArr[0].append(muX)
+            self.signArr[1].append(phi)
+            dphi=phi-2.0*math.pi*(muX%1)
+            if dphi < -math.pi : dphi += 2*math.pi
+            self.signArr[3].append(dphi)
+            self.signArr[2].append(self.bpmSign[name])
+#            amp=self.fitDict[name]["Amp"]
+
+    def calcLocalVector(self,phi0,beta0,alpha0,iturn):
+        def funV(x,xarg):
+            N=int(xarg[0])
+            Z=0.0
+            for i in range(N):
+                Z += (xarg[i*3+2]*x[0]+xarg[i*3+3]*x[1]-xarg[i*3+1])**2.0
+            return Z       
+        jbpm=0; Lbpms=0; fargs=[]; matr=[];
+        fargs.append(Lbpms)  # placeholder
+        for name in self.data.keys():
+            if(name not in self.bpmList): continue
+            if(name in self.badList): continue
+            beta=self.twiss[name][1]
+            alpha=self.twiss[name][2]
+            phi=self.twiss[name][3]
+            dphi=2*self.PI*(phi-phi0)
+            X=self.data[name][iturn]
+            CC=np.cos(dphi)
+            SS=np.sin(dphi)
+            m11=np.sqrt(beta/beta0)*(CC+alpha0*SS)
+            m12=np.sqrt(beta*beta0)*SS
+            m21=-((alpha-alpha0)*CC+(1.0+alpha*alpha0)*SS)/np.sqrt(beta*beta0)
+            m22=np.sqrt(beta0/beta)*(CC-alpha*SS)
+            fargs.append(X)
+            fargs.append(m11)
+            fargs.append(m12)
+            jbpm +=1
+        Lbpms=jbpm
+        fargs[0]=Lbpms
+        Xinit=[0.0,0.0]
+        Z_min=minimize(funV,Xinit,fargs)
+        return Z_min
+
+    def turnFit(self):
+        anglePrev=0.0; dAngArr=[]; NavrTune=20; buffer={};
+        for i in range(self.Nturns):
+            buffer[i]={}
+            Npoints=0
+            SSX=0.0; SCX=0.0; SX=0.0; SCC=0.0; SSC=0.0; SSS=0.0; SX2=0.0;
+            coorSep=[]; phiSep=[]; matrA=[];
+            for name in self.bpmList:
+                if (name not in self.data.keys()): continue
+                if (name in self.badList): continue
+                phi=self.twiss[name][3]
+                CC=np.cos(2*self.PI*phi)
+                SS=np.sin(2.0*self.PI*phi)
+                matrA.append([CC,SS])
+                beta=self.twiss[name][1]
+                X=self.data[name][i]/np.sqrt(beta)*self.bpmSign[name]
+                coorSep.append(X)
+                phiSep.append(phi)
+                Npoints +=1
+            buffer[i]["Xn"]=coorSep
+            buffer[i]["Phi"]=phiSep
+            U,S,V=np.linalg.svd(matrA)
+            AR=0.0; BR=0.0;
+            for ir in [0,1]:
+                for jr in range(Npoints):
+                    AR += V[ir][0]/S[ir]*U[jr][ir]*coorSep[jr]
+                    BR += V[ir][1]/S[ir]*U[jr][ir]*coorSep[jr]
+            Amp=math.sqrt(AR*AR+BR*BR)
+            angle=math.atan2(AR,-BR)
+            Xsep=AR
+            XsepP=BR
+            sErr=0.0
+            for j in range(Npoints):
+                X=(coorSep[j]-AR*np.cos(2.0*self.PI*phiSep[j])-BR*np.sin(self.PI*phiSep[j]))
+                sErr=+ X*X
+            sErr=math.sqrt(sErr/Npoints)
+            fitMu=-(angle-anglePrev)/2.0/self.PI
+            if fitMu<0.0: fitMu=1.0+fitMu
+            dAngArr.append(fitMu)
+            fitMuA=0.0
+            if(i>0):
+                if (len(dAngArr)<NavrTune+1): mAvr=len(dAngArr)-1
+                else: mAvr=NavrTune
+                count=0
+                for ka in range(i-mAvr+1,i+1):
+                    fitMuA += dAngArr[ka]
+                    count+=1
+                fitMuA=fitMuA/mAvr
+            buffer[i]["Xsep"]=Xsep
+            buffer[i]["XsepP"]=XsepP
+            buffer[i]["Err"]=sErr
+            buffer[i]["Amp"]=Amp
+            buffer[i]["fMu"]=fitMu
+            buffer[i]["fMuA"]=fitMuA
+            anglePrev=angle
+        return buffer
+    
+    def analyse_sing(self, fname, fname2=""):
+        readOK=False
+        print("Class aD, processing file ",fname)
+        self.bpmSign={}; self.badList=[]; self.skipList=[];
+        self.data={}; self.intn={}; self.data2={};
+        self.signArr=[[],[],[],[]];
+        self.fname=fname;
+        self.twiss=self.readTwissFunctions(self.TwissFileName);
+        print("reading the position file",fname)
+        self.data=self.readData(self.Nturns,self.fname,True);
+        wpos=fname.find("pos")
+        if(wpos>0):
+            fnameI=fname.replace("pos","int")
+            if(os.path.exists(fnameI)):
+                print("reading the intensity file",fnameI)
+                self.intn=self.readData(self.Nturns,fnameI)
+            if(len(self.intn) >0): print("Intensity from ", fnameI," read, size ",len(self.intn))
+        if(len(fname2) >0):
+            if(os.path.exists(fname2)):
+                print("Second file ",fname2, " exists")
+                readOK=True
+            else:
+                print("Second file ",fname2, " not found")
+                readOK=False
+        if(readOK):
+            print("reading the second file ",fname2)
+            self.data2=self.readData(self.Nturns,fname2,False);
+            self.refOrbits()
+        else:
+            print("skip reading the second file ",fname2)            
+        self.avray0=self.calcRawOffsets();
+        if(len(self.data2)>0):
+            self.avray2=self.calcRawOffsets2();
+# at this point not needed             
+        print("Calling tbtFit ",self.NT_tbt, flush=True)
+        self.fitDict= self.tbtFit(0,self.NT_tbt);
+        self.signCheck();
+        self.avray=self.calcOffsets();
+        self.filterBPMs();
+        self.turnData=self.turnFit()
+        print("Data analysis complete")
+
+class MainApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Delivery Ring Injection TBT")
+        self.geometry("1400x1000")
+
+        self.container = tk.Frame(self)
+        self.container.pack(fill="both", expand=True)
+
+        self.frames = {}
+        for F in (HomeFrame, PlotFrame):
+            frame = F(parent=self.container, controller=self)
+            self.frames[F.__name__] = frame
+            frame.grid(row=0, column=0, sticky="nsew")
+
+        self.show_frame("HomeFrame")
+
+    def show_frame(self, frame_name):
+        frame = self.frames[frame_name]
+        frame.tkraise()
+
+class HomeFrame(tk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+
+# data object
+        self.aD=analyseData.get_instance()
+        print("Home Frame: AD instance ",self.aD.get_name()," fname ",self.aD.get_data_name())
+
+        self.waveform_options = {1:["Amp", "None", "None", "None"],2:["Int", "None", "None", "None"],3:["Offs", "Offs2", "Err", "None"],4:["PhCheck", "Sign", "Err", "None"],5:["tbt", "Fit", "Curv", "None"],6:["InjErr", "None", "None", "None"]}
+
+        font_small = ("TkDefaultFont", 8)
+
+        # --- Container 1 ---
+        container1 = tk.LabelFrame(self, text="Input parameters", padx=10, pady=10, font=font_small)
+        container1.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+
+        tk.Button(container1, text="Acquire TBT Data", command=self.acquire_data, font=font_small).grid(row=0, column=0, columnspan=2, pady=5)
+
+        self.file_listbox = tk.Listbox(container1, height=5, font=font_small)
+        self.file_listbox.grid(row=1, column=0, columnspan=2)
+        self.update_file_list()
+
+        tk.Button(container1, text="Refresh File List", command=self.update_file_list, font=font_small).grid(row=2, column=0, columnspan=2, pady=5)
+
+        tk.Label(container1, text="Selected File:", font=font_small).grid(row=3, column=0)
+        self.file_entry = tk.Entry(container1, font=font_small)
+        self.file_entry.insert(0,"6_BPM.csv")
+        self.file_entry.grid(row=3, column=1)
+        self.file_listbox.bind("<<ListboxSelect>>", self.on_file_select)
+
+        tk.Label(container1, text="Secondary File:", font=font_small).grid(row=4, column=0)
+        self.file_entry2 = tk.Entry(container1, font=font_small)
+        self.file_entry2.insert(0,"")
+        self.file_entry2.grid(row=4, column=1)
+
+        tk.Label(container1, text="TBT mode:", font=font_small).grid(row=5, column=0)
+        self.mode1 = tk.Entry(container1, font=font_small)
+        self.mode1.insert(0,"1")
+        self.mode1.grid(row=5, column=1)
+
+        tk.Label(container1, text="Mode 2:", font=font_small).grid(row=6, column=0)
+        self.mode2 = tk.Entry(container1, font=font_small)
+        self.mode2.grid(row=6, column=1)
+
+        tk.Label(container1, text="Turns:", font=font_small).grid(row=7, column=0)
+        self.turns_entry = tk.Entry(container1, font=font_small)
+        self.turns_entry.delete(0, tk.END)
+        self.turns_entry.insert(0,"100")
+        self.turns_entry.grid(row=7, column=1)
+
+        tk.Label(container1, text="BPM Name:", font=font_small).grid(row=8, column=0)
+        self.bpm_entry = tk.Entry(container1, font=font_small)
+        self.bpm_entry.delete(0, tk.END)
+        self.bpm_entry.insert(0,"HP203")
+        self.bpm_entry.grid(row=8, column=1)
+
+        tk.Button(container1, text="Analyse Single TBT", command=self.analyse_single, font=font_small).grid(row=9, column=0, columnspan=2, pady=5)
+
+        # --- Container 2 ---
+        container2 = tk.LabelFrame(self, text="Plot Settings", padx=10, pady=10, font=font_small)
+        container2.grid(row=0, column=1, padx=5, pady=5, sticky="nsew")
+
+        tk.Label(container2, text="Input 1:", font=font_small).grid(row=0, column=0)
+        self.number_entry = tk.Entry(container2, font=font_small)
+        self.number_entry.grid(row=0, column=1)
+
+        tk.Label(container2, text="Input 2:", font=font_small).grid(row=1, column=0)
+        self.name_entry = tk.Entry(container2, font=font_small)
+        self.name_entry.grid(row=1, column=1)
+
+        self.waveform_vars = {}
+        self.xmin_entries = {}
+        self.xmax_entries = {}
+
+        for i in range(6):
+            frame = tk.LabelFrame(container2, text=f"Graph {i+1}",font=font_small)
+            frame.grid(row=2+i, column=0, columnspan=2, pady=2, sticky="w")
+ #           frame.grid_propagate(False)    #  Bad idea!
+            var_group = []
+            for j, option in enumerate(self.waveform_options[i+1]):
+                if (option=="None"):
+                    tk.Label(frame,text="    ").grid(row=0,column=j)
+                    continue
+                var = tk.IntVar()
+                var.set(1)
+                tk.Checkbutton(frame, text=option, variable=var, font=font_small).grid(row=0, column=j, sticky="w")
+                var_group.append(var)
+            self.waveform_vars[i]=var_group
+
+            xmiLbl=tk.Label(frame, text="Xmin:", font=font_small)
+            xmiLbl.grid(row=0, column=3)
+#            xmiLbl.place(relx=-3.0,rely=0.0,anchor='e')
+            xmin = tk.Entry(frame, width=6, font=font_small)
+            xmin.delete(0, tk.END)
+            xmin.insert(0,"0.0")
+#            xmin.place(relx=-2.0,rely=0.0,anchor='e')
+            xmin.grid(row=0, column=4)
+            self.xmin_entries[i]=xmin
+
+            xmaLbl=tk.Label(frame, text="Xmax:", font=font_small)
+            xmaLbl.grid(row=0, column=5)
+#            xmaLbl.place(relx=-1.0,rely=0.0,anchor='e')
+            xmax = tk.Entry(frame, width=6, font=font_small)
+            xmax.delete(0, tk.END)
+            xmax.insert(0,"1000.0")
+            xmax.grid(row=0, column=6)
+#            xmin.place(relx=0.0,rely=0.0,anchor='e')
+            self.xmax_entries[i]=xmax
+
+# --- Plot Area ---
+        self.fig = plt.figure(figsize=(12, 5))
+        self.axs = [self.fig.add_subplot(2, 3, i + 1) for i in range(5)]
+        self.axs.append(self.fig.add_subplot(2, 3, 6, projection='polar'))
+
+        # --- Container 3 ---
+        container3 = tk.LabelFrame(self, text="Control Panel", padx=10, pady=10, font=font_small)
+        container3.grid(row=0, column=2, padx=5, pady=5, sticky="nsew")
+
+        tk.Button(container3, text="Update Plots", command=self.update_plots, font=font_small).pack(pady=5, fill='x')
+        tk.Button(container3, text="Go to Plot Frame", command=lambda: self.controller.show_frame("PlotFrame"), font=font_small).pack(pady=5, fill='x')
+        tk.Button(container3, text="Exit", command=self.controller.quit, font=font_small).pack(pady=5, fill='x')
+
+        # --- Container 4---
+        container4 = tk.LabelFrame(self, text="Output Panel", padx=10, pady=10, font=font_small)
+        container4.grid(row=0, column=3, padx=5, pady=5, sticky="nsew")
+
+        tk.Label(container4, text="Seed tune:", font=font_small).grid(row=0, column=0)
+        self.stune_var = tk.Entry(container4, font=font_small)
+        self.stune_var.grid(row=0, column=1)
+#        self.stune_var.insert(0,"0.650")
+
+        tk.Label(container4, text="New tune:", font=font_small).grid(row=1, column=0)
+        self.ntune_var = tk.Entry(container4, font=font_small)
+        self.ntune_var.grid(row=1, column=1)
+
+        tk.Label(container4, text="Inj amp:", font=font_small).grid(row=2, column=0)
+        self.ampin_var = tk.Entry(container4, font=font_small)
+        self.ampin_var.grid(row=2, column=1)
+
+        tk.Label(container4, text="Inj phase:", font=font_small).grid(row=3, column=0)
+        self.phsin_var = tk.Entry(container4, font=font_small)
+        self.phsin_var.grid(row=3, column=1)
+
+        tk.Label(container4, text="Av inj amp:", font=font_small).grid(row=4, column=0)
+        self.avampin_var = tk.Entry(container4, font=font_small)
+        self.avampin_var.grid(row=4, column=1)
+
+        tk.Label(container4, text="Av inj phase:", font=font_small).grid(row=5, column=0)
+        self.avphsin_var = tk.Entry(container4, font=font_small)
+        self.avphsin_var.grid(row=5, column=1)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, self)
+        self.canvas.get_tk_widget().grid(row=1, column=0, columnspan=4, pady=10)
+
+    def update_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        path='.'
+        files=os.listdir(path)
+        files_with_time=[(os.path.getctime(os.path.join(path,file)),file) for file in files]
+        files_with_time.sort()
+        sorted_files=[file for _, file in files_with_time]
+#        for f in os.listdir('.'):
+        for f in sorted_files:
+            if f.endswith('.csv'):
+                self.file_listbox.insert(tk.END, f)
+
+    def on_file_select(self, event):
+        widget = event.widget
+        if widget.curselection():
+            index = widget.curselection()[0]
+            value = widget.get(index)
+            self.file_entry.delete(0, tk.END)
+            self.file_entry.insert(0, value)
+
+    def acquire_data(self):
+        print("Data acquisition triggered, wait...")
+        try:
+            result = subprocess.run(['./bpm_capture.sh'], check=False, capture_output=True, text=True)
+#            result = subprocess.run(['./bpm_capture.sh'], check=True, capture_output=True, text=True)
+            print(result.stdout)
+        except subprocess.CalledProcessError as e:
+            print(f"Error executing command: {e}")
+            print(e.stderr)
+
+    def analyse_single(self):
+        fname=self.file_entry.get()
+        fname2=self.file_entry2.get()
+        tbtmode=int(self.mode1.get())
+#        in_tune=float(self.stune_var.get())
+        print("Single TBT analyses from ",fname," triggered, mode=",tbtmode)
+        self.aD.tbtMode=tbtmode
+        in_tune=self.aD.tune
+        self.aD.analyse_sing(fname,fname2)
+        out_tune=self.aD.tune
+        sname=self.bpm_entry.get()
+        amp=self.aD.fitDict[sname]["Amp"]
+        phase=(self.aD.fitDict[sname]["Phi"]+self.aD.twiss[sname][3]*2*math.pi)%(2.0*math.pi)
+        avamp=self.aD.ampin
+        avphase=self.aD.phsin*180.0/math.pi   # displayed phase in degrees
+        if avphase < 0.0: avphase += math.pi
+        self.stune_var.delete(0,tk.END)
+        self.stune_var.insert(0,str(in_tune))
+        self.ntune_var.delete(0,tk.END)
+        self.ntune_var.insert(0,str(out_tune))
+        self.ampin_var.delete(0,tk.END)
+        self.ampin_var.insert(0,str(amp))
+        self.phsin_var.delete(0,tk.END)
+        self.phsin_var.insert(0,str(phase))
+
+        self.avampin_var.delete(0,tk.END)
+        self.avampin_var.insert(0,str(avamp))
+        self.avphsin_var.delete(0,tk.END)
+        self.avphsin_var.insert(0,str(avphase))
+
+        self.update_plots(True)
+
+    def update_plots(self, new=False):
+        if(len(self.aD.data)==0):
+            print("Update_plots: you have no data!")
+            return
+        Nt=int(self.turns_entry.get())
+        sname=self.bpm_entry.get()
+        strnew="false"
+        if (new): strnew="true"
+        print("Update plots: sname=",sname,Nt," new=",strnew)
+        for i, ax in enumerate(self.axs):
+            ax.cla()
+            xmin = self.xmin_entries[i]
+            xmax = self.xmax_entries[i]
+ 
+            if i == 0:                
+                y1=[]; 
+                Nturns=self.aD.Nturns
+                x1 = np.linspace(0, Nturns-1, Nturns)
+                for ii in range(Nturns):
+                    y1.append(self.aD.data[sname][ii])
+                ax.plot(x1, y1, 'm')
+                ax.set_title(sname+" amplitude")
+                xmi=min(x1); xma=max(x1)
+                if(new):
+                    xmin.delete(0, tk.END)
+                    xmax.delete(0, tk.END)
+                    xmin.insert(0,str(xmi))
+                    xmax.insert(0,str(xma))
+                else:
+                    ax.set_xlim(float(xmin.get()), float(xmax.get()))
+
+            elif i == 1:
+                if(len(self.aD.intn)==0):
+                    print("No intensity data!")
+                    continue
+                y2=[]; 
+                Nturns=self.aD.Nturns
+                x2 = np.linspace(0, Nturns-1, Nturns)
+                for ii in range(Nturns):
+                    y2.append(self.aD.intn[sname][ii])
+                ax.plot(x2, y2, 'm')
+                ax.set_title(sname+" intensity")
+                xmi=min(x2); xma=max(x2);
+                ymi=0.0; yma=1.2*max(y2);
+                ax.set_ylim(ymi,yma)
+                if(new):
+                    xmin.delete(0, tk.END)
+                    xmax.delete(0, tk.END)
+                    xmin.insert(0,str(xmi))
+                    xmax.insert(0,str(xma))
+                else:
+                    ax.set_xlim(float(xmin.get()), float(xmax.get()))
+
+            elif i==2:
+                x3=[]; y3=[]; y31=[]; y32=[];
+                for name in self.aD.bpmNames:
+                    if (name not in self.aD.data.keys()): continue
+                    if (name in self.aD.badList): continue
+                    muX=self.aD.twiss[name][3]
+                    av0=self.aD.avray0[name]
+                    av=self.aD.avray[name]
+                    err=self.aD.fitDict[name]["Err"]
+                    x3.append(muX)
+                    y3.append(av)
+                    y31.append(av0)
+                    y32.append(err)
+                if(self.waveform_vars[i][0].get()):
+                    ax.plot(x3, y3, 'b', marker='o',linestyle='None')
+                if(self.waveform_vars[i][1].get()):
+                    ax.plot(x3, y31, 'g', marker='o',linestyle='None')
+                if(self.waveform_vars[i][2].get()):
+                    ax.plot(x3, y32, 'y', marker='+',linestyle='None')
+                ax.set_title("BPM offsets")
+                xmi=min(x3); xma=max(x3)
+                if(new):
+                    xmin.delete(0, tk.END)
+                    xmax.delete(0, tk.END)
+                    xmin.insert(0,str(xmi))
+                    xmax.insert(0,str(xma))
+                else:
+                    ax.set_xlim(float(xmin.get()), float(xmax.get()))
+
+            elif i == 3:
+                x43=[]; y43=[];
+                x4=self.aD.signArr[0]
+                y4=self.aD.signArr[1]
+                y42=self.aD.signArr[2]
+                y44=self.aD.signArr[3]
+                if(self.waveform_vars[i][0].get()):
+                    ax.plot(x4, y4,'b', marker='o',linestyle='None')
+                    ax.plot(x4, y44,'r', marker='o',linestyle='None')
+                if(self.waveform_vars[i][1].get()):
+                    ax.plot(x4, y42, marker='+',linestyle='None')
+                ax.plot(x43, y43, 'r', marker='o',linestyle='None')
+
+                ax.set_title("Phase Shift/Sign")
+                xmi=min(x4); xma=max(x4)
+                if(new):
+                    xmin.delete(0, tk.END)
+                    xmax.delete(0, tk.END)
+                    xmin.insert(0,str(xmi))
+                    xmax.insert(0,str(xma))
+                else:
+                    ax.set_xlim(float(xmin.get()), float(xmax.get()))
+
+            elif i==4:
+                print("Plots: Read ",sname," NT=",Nt)
+                ntfit=Nt*10
+                y5=[]; y52=[]; y53=[];
+                x5 = np.linspace(0, Nt-1,Nt)
+                x52=np.linspace(0, ntfit-1,ntfit)*float(Nt/ntfit)
+                for ii in range(Nt):
+                    y5.append(self.aD.data[sname][ii])
+                    y52.append(self.aD.fitDict[sname]["Fit"][ii])
+                khi=self.aD.fitDict[sname]["Phi"]
+                ampF=self.aD.fitDict[sname]["Amp"]
+                for ii in range(ntfit):
+                    phi=2.0*math.pi*self.aD.tune*x52[ii]
+                    y53.append(ampF*np.sin(phi)+self.aD.fitDict[sname]["Avr"])
+                if(self.waveform_vars[i][0].get()):
+                    ax.plot(x5, y5, 'g', marker='o',linestyle='None')
+                if(self.waveform_vars[i][1].get()):
+                    ax.plot(x5, y52, 'b', marker='o',linestyle='None')
+                if(self.waveform_vars[i][2].get()):
+                    ax.plot(x52, y53, 'b', marker='')
+                    ax.set_title("TBT fit in "+sname)
+                xmi=min(x5); xma=max(x5)
+                if(new):
+                    xmin.delete(0, tk.END)
+                    xmax.delete(0, tk.END)
+                    xmin.insert(0,str(xmi))
+                    xmax.insert(0,str(xma))
+                else:
+                    ax.set_xlim(float(xmin.get()), float(xmax.get()))
+                                
+            else:
+                for j, var in enumerate(self.waveform_vars[i]):
+                    xall=[]; yall=[];
+                    if var.get():
+#                        phiL = self.aD.twiss[sname][3]
+                        xpol=self.aD.fitDict[sname]["Phi0"]
+                        ypol=self.aD.fitDict[sname]["Amp"]
+                        ax.plot(xpol,ypol, 'r', marker='o', markersize=10)
+                        xpolav=self.aD.phsin
+                        ypolav=self.aD.ampin;
+                        ax.plot(xpolav,ypolav, 'b', marker='o')
+                        print("Inj Pol plot:", xpol, ypol, xpolav, ypolav)
+                        for name in self.aD.fitDict.keys():
+                            xall.append(self.aD.fitDict[name]["Phi0"])
+                            yall.append(self.aD.fitDict[name]["Amp"])
+                        ax.plot(xall,yall, 'g', marker='o',linestyle='',markersize=5)
+                ax.set_title("Injection error")
+#                ax.set_rmax(2.0)
+#                ax.legend(loc='upper right')
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+
+class PlotFrame(tk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+
+        font_small = ("TkDefaultFont", 8)
+
+        label = tk.Label(self, text="Orbit fit Frame")
+        label.grid(row=0, column=0, columnspan=2, pady=10)
+#       label.pack(pady=10)
+
+        # Variables for updating plots
+        self.var3 = tk.IntVar(value=100)
+        self.var4 = tk.StringVar(value="HP203")
+
+        # data object
+        self.aD=analyseData.get_instance()
+        print("Fit Frame: AD instance ",self.aD.get_name()," fname ",self.aD.get_data_name())
+        print("Data file not analysed here!")
+        
+        # Input Fields
+        tk.Label(self, text="Number of Turns:").grid(row=1, column=0, padx=5, pady=5)
+        tk.Entry(self, textvariable=self.var3).grid(row=1, column=1, padx=5, pady=5)
+
+        tk.Label(self, text="BPM name:").grid(row=2, column=0, padx=5, pady=5)
+        tk.Entry(self, textvariable=self.var4).grid(row=2, column=1, padx=5, pady=5)
+
+        # Create the plot area
+        self.fig, self.axs = plt.subplots(2, 2, figsize=(12, 6))
+        self.canvas = FigureCanvasTkAgg(self.fig, self)
+        self.canvas.get_tk_widget().grid(row=3, column=0, columnspan=2)
+
+        # Button to update plots
+        tk.Button(self, text="Update Plots", command=self.update_plots).grid(row=4, column=0, columnspan=2, pady=10)
+
+        # Navigation Button
+        tk.Button(self, text="TBT page", command=lambda: controller.show_frame("HomeFrame")).grid(row=5, column=0, columnspan=2, pady=10)
+        # Quit Button
+        tk.Button(self, text="Exit", command=self.controller.quit, font=font_small).grid(row=6, column=0, columnspan=2, pady=10)
+       # .pack(pady=5, fill='x')
+
+        
+        # Initial Plot
+#        self.update_plots()
+
+    def update_plots(self):
+        if(len(self.aD.data)==0):
+            print("Update_plots: you have no data!")
+            return
+        nt=self.var3.get(); sname=self.var4.get();
+        print("Fit Frame: Read ",sname," NT=",nt)
+
+        xpl1=[]; zpl1=[]; zpl12=[]; zpl2=[]; zpl21=[];
+#        for i in range(self.aD.Nturns):
+        for i in range(500):
+            xpl1.append(float(i))
+            zpl1.append(self.aD.turnData[i]["Amp"])
+            zpl12.append(self.aD.turnData[i]["Err"])
+            zpl2.append(self.aD.turnData[i]["fMu"])
+            zpl21.append(self.aD.turnData[i]["fMuA"])
+        self.axs[0, 0].cla()
+        self.axs[0, 0].plot(xpl1, zpl1, 'b')
+        self.axs[0, 0].plot(xpl1, zpl12, 'r')
+        self.axs[0, 0].set_title("Amplitudes/Errors")
+
+        self.axs[0, 1].cla()
+        self.axs[0, 1].set_ylim(0.6,0.7)
+        self.axs[0, 1].plot(xpl1, zpl2, 'b')
+        self.axs[0, 1].plot(xpl1, zpl21, 'g')
+        self.axs[0, 1].set_title("Tunes")
+        self.axs[0, 1].set_ylim(0.63, 0.67)
+
+# FitFrame
+
+        xpl3=[]; zpl3=[]; zpl32=[]; zpl33=[];
+        betaL=self.aD.twiss[sname][1]
+        alphaL = self.aD.twiss[sname][2]
+        phiL = self.aD.twiss[sname][3]
+        fileN_sep=OUTPUT_DIR / "temp_sep_port.dat"
+        file_sep=open(fileN_sep,"w")
+        for kturn in range(nt):
+            X0=self.aD.data[sname][kturn]/np.sqrt(betaL)
+            Zloc=self.aD.calcLocalVector(phiL,betaL,alphaL,kturn)
+            xn=Zloc.x[0]/np.sqrt(betaL)
+            xpn=Zloc.x[1]*np.sqrt(betaL)+alphaL*xn
+            xpl3.append(float(kturn))
+            zpl3.append(xn)
+            zpl32.append(xpn)
+            zpl33.append(X0)
+            str_out=str(kturn)+" "+str(xn)+" "+str(xpn)+" "+str(X0)+"\n"
+            file_sep.write(str_out)
+        file_sep.close()
+            
+        self.axs[1, 0].cla()
+        self.axs[1, 0].plot(xpl3, zpl3, 'g')
+        self.axs[1, 0].plot(xpl3, zpl33, 'b')
+        self.axs[1, 0].set_title("Local fit X at "+sname)
+
+        self.axs[1, 1].cla()
+        self.axs[1, 1].plot(zpl3, zpl32, 'm', marker='o',linestyle='None')
+        self.axs[1, 1].set_title("Local fit Phase space at "+sname)
+        xmax=max(zpl32)*1.2
+        self.axs[1, 1].set_xlim(-2*xmax, 2*xmax)
+        self.axs[1, 1].set_ylim(-xmax, xmax)
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+        
+        back_button = tk.Button(self, text="Back to Home", command=lambda: controller.show_frame("HomeFrame"))
+        back_button.pack()
+
+if __name__ == "__main__":
+    app = MainApp()
+    app.mainloop()
