@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "inj-mon: injOrbits",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/inj-mon/src/inj_mon/injOrbits.py",
+            "cwd": "${workspaceFolder}/inj-mon",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/inj-mon/src"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}
